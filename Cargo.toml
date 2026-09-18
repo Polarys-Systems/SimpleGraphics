@@ -1,0 +1,16 @@
+[package]
+name = "simple-graphics"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[dependencies]
+ash = { path = "./src/ash/ash", default-features = false, features = ["loaded", "debug", "std"] }
+ash-window = { path = "./src/ash/ash-window" }
+harfrust = { path = "./src/harfrust/harfrust", version = "0.13.3" }
+vk-mem = { path = "./src/vk-mem-rs" }
+winit = { path = "./src/winit", version = "0.30.13" }
+
+[patch.crates-io]
+ash = { path = "./src/ash/ash" }
+winit = { path = "./src/winit" }

@@ -1,0 +1,12 @@
+[submodule "src/ash"]
+	path = src/ash
+	url = git@github.com:ash-rs/ash.git
+[submodule "src/vk-mem-rs"]
+	path = src/vk-mem-rs
+	url = git@github.com:gwihlidal/vk-mem-rs.git
+[submodule "src/winit"]
+	path = src/winit
+	url = https://github.com/rust-windowing/winit.git
+[submodule "src/harfrust"]
+	path = src/harfrust
+	url = https://github.com/harfbuzz/harfrust.git
