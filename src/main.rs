@@ -12,6 +12,8 @@ use harfrust::{
     FontRef, ShapeOptions, ShaperData, UnicodeBuffer
 };
 
+mod simple_ttf;
+
 #[derive(Default)]
 struct App {
     window: Option<Arc<Window>>,
@@ -259,7 +261,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let font = FontRef::from_index(&font_data, 0)?;
     let shaper_data = ShaperData::new(&font);
     let shaper = ShaperData::shaper(&shaper_data, &font);
-    
+
+    let mut parser = simple_ttf::TTFParser::read_from("./data/Syne/static/Syne-Regular.ttf").expect("failed to read font");
+
+    parser.parse_information();
+
     let mut app = App::default();
     let mut arguments = std::env::args().skip(1);
 
