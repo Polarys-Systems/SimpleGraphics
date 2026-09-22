@@ -1,0 +1,126 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+
+// Quadratic TrueType coverage rasterizer. One dispatch per atlas rectangle.
+// Input: y-monotonic quadratics in font units, with Y already flipped downward.
+// Output: linear grayscale coverage, NOT a signed distance field.
+//
+// Vulkan: glslc --target-env=vulkan1.3 -DATLAS_RGBA8=1 -fshader-stage=compute
+// texture_atlas.comp -o texture_atlas.comp.spv
+// Query R8_UNORM storage-image, sampling, and linear-filter format support. Compile with
+// -DATLAS_RGBA8=1 and use an RGBA8_UNORM image as a fallback; sample its red channel.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+struct Quadratic {
+    vec4 p0_p1;       // start.xy, control.xy; start.y <= control.y <= end.y
+    vec4 p2_winding;  // end.xy, original direction (+1 or -1), unused
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer CurveBuffer {
+    Quadratic curves[];
+};
+
+#ifdef ATLAS_RGBA8
+#define ATLAS_FORMAT rgba8
+#else
+#define ATLAS_FORMAT r8
+#endif
+
+layout(ATLAS_FORMAT, set = 1, binding = 0) uniform writeonly image2D atlases[];
+layout(push_constant, std430) uniform RasterJob {
+    CurveBuffer curves;
+    uvec4 rect;           // atlas x, atlas y, width, height, INCLUDING padding
+    uvec4 segment_range;  // first segment, number of segments, uploaded count, unused
+    vec4 mapping;        // inverse scale, origin.x - phase.x, origin.y - phase.y, unused
+} job;
+
+// Solve y(t) = sample_y for an increasing, monotonic quadratic.
+// Normalize endpoints to [0,1]. Then u = a*t*t + b*t,
+// where b = 2*control_y and a = 1-b.
+// Rationalizing the positive root avoids cancellation and also handles a=0
+// (straight lines) without a separate linear/quadratic threshold.
+float intersection_x(Quadratic curve, float sample_y) {
+    vec2 p0 = curve.p0_p1.xy;
+    vec2 p1 = curve.p0_p1.zw;
+    vec2 p2 = curve.p2_winding.xy;
+    float height = p2.y - p0.y; // Strictly positive; caller rejects zero spans.
+    float u = clamp((sample_y - p0.y) / height, 0.0, 1.0);
+    if (u == 0.0) {
+        return p0.x;
+    }
+    float b = 2.0 * clamp((p1.y - p0.y) / height, 0.0, 1.0);
+    float discriminant = max(b * b + 4.0 * (1.0 - b) * u, 0.0);
+    float t = clamp((2.0 * u) / (b + sqrt(discriminant)), 0.0, 1.0);
+    return mix(mix(p0.x, p1.x, t), mix(p1.x, p2.x, t), t);
+}
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (gl_GlobalInvocationID.z != 0u || any(greaterThanEqual(pixel, job.rect.zw))) {
+        return;
+    }
+
+    // Invalid jobs are rejected, not partially clipped. Validate them on the host
+    // too: an early return leaves the rectangle's previous contents untouched.
+    uvec2 atlas_size = uvec2(imageSize(atlases[0]));
+    if (any(greaterThan(job.rect.xy, atlas_size))) {
+        return;
+    }
+    if (any(greaterThan(job.rect.zw, atlas_size - job.rect.xy))) {
+        return;
+    }
+    uint available = job.segment_range.z;
+    uint first = job.segment_range.x;
+    uint count = job.segment_range.y;
+    if (first > available || count > available - first) {
+        return;
+    }
+
+    float inv_scale = job.mapping.x;
+    // Four horizontal sample positions, reused for every vertical sample row.
+    vec4 sample_x = (vec4(float(pixel.x) + job.mapping.y)
+        + vec4(0.125, 0.375, 0.625, 0.875)) * inv_scale;
+    uint covered = 0u;
+
+    for (int row = 0; row < 4; ++row) {
+        float sample_y = (float(pixel.y) + job.mapping.z
+            + (float(row) + 0.5) * 0.25) * inv_scale;
+        ivec4 winding = ivec4(0);
+
+        for (uint i = 0u; i < count; ++i) {
+            Quadratic curve = job.curves.curves[first + i];
+            // Half-open intervals avoid counting shared vertices twice.
+            // Horizontal/degenerate segments contribute no crossings.
+            float y0 = curve.p0_p1.y;
+            float y2 = curve.p2_winding.y;
+            if (y2 <= y0 || sample_y < y0 || sample_y >= y2) {
+                continue;
+            }
+            float x0 = curve.p0_p1.x;
+            float x1 = curve.p0_p1.z;
+            float x2 = curve.p2_winding.x;
+            float min_x = min(x0, min(x1, x2));
+            float max_x = max(x0, max(x1, x2));
+            if (max_x <= sample_x.x) {
+                continue;
+            }
+            int direction = int(curve.p2_winding.z);
+            // The Bezier convex hull is wholly to the right of all four samples.
+            if (min_x > sample_x.w) {
+                winding += ivec4(direction);
+                continue;
+            }
+            float crossing_x = intersection_x(curve, sample_y);
+            winding += ivec4(greaterThan(vec4(crossing_x), sample_x)) * direction;
+        }
+
+        // Combine ALL contours before deciding inside/outside (nonzero fill).
+        covered += uint(winding.x != 0) + uint(winding.y != 0)
+                 + uint(winding.z != 0) + uint(winding.w != 0);
+    }
+
+    float coverage = float(covered) * (1.0 / 16.0);
+    // Every pixel in the job is written, including zero-valued gutter pixels.
+    imageStore(atlases[0], ivec2(job.rect.xy + pixel), vec4(coverage, 0.0, 0.0, 1.0));
+}

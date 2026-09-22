@@ -8,11 +8,16 @@
 //! ```
 //!
 //! It supports Unicode `cmap` formats 4 and 12, both `loca` encodings, simple
-//! `glyf` outlines, and horizontal metrics from `hhea`/`hmtx`. Coordinates and
-//! metrics are returned in font units. Multiply them by
+//! and composite `glyf` outlines, and horizontal metrics from `hhea`/`hmtx`.
+//! Coordinates and metrics are returned in font units. Multiply them by
 //! `pixel_height / units_per_em` before rendering at a desired pixel height.
 //!
-//! Compound glyphs, CFF outlines, hint execution, kerning, shaping, and
+//! Composite components are flattened in font space, including nested transforms
+//! and attachment by explicit contour point. Phantom-point attachment is rejected
+//! as unsupported. Pixel-grid rounding and hint instructions are not executed.
+//! `horizontal_metrics()` returns raw `hmtx` values, not `USE_MY_METRICS` resolution.
+//!
+//! CFF outlines, font variations, hint execution, kerning, shaping, and
 //! rasterization are intentionally outside this module's current scope.
 //!
 //! # Basic use
@@ -40,6 +45,24 @@ const Y_SHORT_VECTOR: u8 = 0x04;
 const REPEAT_FLAG: u8 = 0x08;
 const X_IS_SAME_OR_POSITIVE_X_SHORT_VECTOR: u8 = 0x10;
 const Y_IS_SAME_OR_POSITIVE_Y_SHORT_VECTOR: u8 = 0x20;
+
+// Composite-glyph flags from the OpenType glyf specification.
+const ARG_1_AND_2_ARE_WORDS: u16 = 0x0001;
+const ARGS_ARE_XY_VALUES: u16 = 0x0002;
+const WE_HAVE_A_SCALE: u16 = 0x0008;
+const MORE_COMPONENTS: u16 = 0x0020;
+const WE_HAVE_AN_X_AND_Y_SCALE: u16 = 0x0040;
+const WE_HAVE_A_TWO_BY_TWO: u16 = 0x0080;
+const WE_HAVE_INSTRUCTIONS: u16 = 0x0100;
+const SCALED_COMPONENT_OFFSET: u16 = 0x0800;
+const UNSCALED_COMPONENT_OFFSET: u16 = 0x1000;
+
+// Implementation limits, not limits imposed by the font format. Bound both
+// recursion and total expansion: a shallow component graph can still expand
+// exponentially when it references the same child more than once.
+const MAX_GLYPH_LOAD_DEPTH: usize = 32;
+const MAX_GLYPH_LOAD_VISITS: usize = 4096;
+const MAX_GLYPH_LOAD_POINTS: usize = 1 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Values from `head` needed to scale outlines and decode `loca`.
@@ -210,7 +233,7 @@ pub struct GlyphBounds {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-/// Decoded geometry of a simple TrueType glyph.
+/// Decoded geometry of a simple or flattened composite TrueType glyph.
 pub struct Glyph {
     /// Bounding box from the glyph header.
     pub bounds: GlyphBounds,
@@ -399,7 +422,16 @@ impl TTFParser {
         Some(start..end)
     }
 
-    /// Decodes a simple TrueType glyph from `glyf`.
+    /// Decodes a simple or composite TrueType glyph from `glyf`.
+    ///
+    /// Composite children are recursively decoded, transformed, and appended in
+    /// font order. Explicit point indices are resolved before path conversion
+    /// inserts implied points. Results remain unhinted, in font units.
+    ///
+    /// `ROUND_XY_TO_GRID` is intentionally ignored: pixel-grid rounding requires
+    /// a device scale and belongs to a future hinted loader. Instruction bytes
+    /// are bounds-checked but not executed. `USE_MY_METRICS` does not change this
+    /// geometry-only result or the raw values returned by `horizontal_metrics`.
     ///
     /// Returns `Ok(None)` when `loca` declares an empty range. A non-empty
     /// zero-contour glyph is represented by `Some(Glyph)` with no contours.
@@ -407,22 +439,129 @@ impl TTFParser {
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidData`] for an out-of-range glyph ID,
-    /// [`io::ErrorKind::Unsupported`] for a compound glyph, and a data error for
-    /// malformed or truncated outline data.
+    /// malformed components, cycles, or an exceeded expansion limit. Returns
+    /// [`io::ErrorKind::Unsupported`] for attachment using phantom points, and
+    /// [`io::ErrorKind::UnexpectedEof`] for truncated data.
     pub fn load_glyph(&self, glyph_id: u16) -> io::Result<Option<Glyph>> {
+        let mut active = Vec::with_capacity(MAX_GLYPH_LOAD_DEPTH);
+        let mut budget = GlyphLoadBudget {
+            visits: MAX_GLYPH_LOAD_VISITS,
+            points: MAX_GLYPH_LOAD_POINTS,
+        };
+        self.load_glyph_inner(glyph_id, &mut active, &mut budget)
+    }
+
+    fn load_glyph_inner(
+        &self,
+        glyph_id: u16,
+        active: &mut Vec<u16>,
+        budget: &mut GlyphLoadBudget,
+    ) -> io::Result<Option<Glyph>> {
+        if active.len() >= MAX_GLYPH_LOAD_DEPTH {
+            return Err(invalid_data("composite glyph nesting exceeds loader limit"));
+        }
+        if active.contains(&glyph_id) {
+            return Err(invalid_data("cyclic composite glyph reference"));
+        }
+        budget.visits = budget.visits.checked_sub(1)
+            .ok_or_else(|| invalid_data("glyph expansion exceeds visit limit"))?;
         let range = self
             .glyph_range(glyph_id)
             .ok_or_else(|| invalid_data("glyph ID is outside maxp.numGlyphs"))?;
         if range.is_empty() {
             return Ok(None);
         }
-        parse_simple_glyph(&self.font_data[range])
+        let data = &self.font_data[range];
+        require(data, 0, 10, "glyf header")?;
+        if read_i16(data, 0)? >= 0 {
+            let glyph = parse_simple_glyph(data)?;
+            if let Some(glyph) = &glyph {
+                let count: usize = glyph.contours.iter().map(|c| c.points.len()).sum();
+                budget.points = budget.points.checked_sub(count)
+                    .ok_or_else(|| invalid_data("glyph expansion exceeds point limit"))?;
+            }
+            return Ok(glyph);
+        }
+
+        active.push(glyph_id);
+        let result = self.load_composite_glyph(data, active, budget);
+        active.pop();
+        result.map(Some)
+    }
+
+    fn load_composite_glyph(
+        &self,
+        data: &[u8],
+        active: &mut Vec<u16>,
+        budget: &mut GlyphLoadBudget,
+    ) -> io::Result<Glyph> {
+        let mut glyph = Glyph {
+            bounds: GlyphBounds {
+                x_min: read_i16(data, 2)?,
+                y_min: read_i16(data, 4)?,
+                x_max: read_i16(data, 6)?,
+                y_max: read_i16(data, 8)?,
+            },
+            contours: Vec::new(),
+        };
+        let mut reader = GlyphReader { data, cursor: 10 };
+        let mut has_instructions = false;
+        let mut first_component = true;
+        loop {
+            let component = GlyphComponent::read(&mut reader)?;
+            has_instructions |= component.flags & WE_HAVE_INSTRUCTIONS != 0;
+            if first_component && matches!(component.placement, ComponentPlacement::Points(..)) {
+                return Err(invalid_data("first composite component must use XY offsets"));
+            }
+            first_component = false;
+            let child = self.load_glyph_inner(component.glyph_id, active, budget)?;
+            let mut contours = child.map(|g| g.contours).unwrap_or_default();
+
+            let offset = match component.placement {
+                ComponentPlacement::Offset(offset) => {
+                    let offset_flags = component.flags
+                        & (SCALED_COMPONENT_OFFSET | UNSCALED_COMPONENT_OFFSET);
+                    // Neither flag, or both flags: use the recommended default,
+                    // an unscaled offset. Ignore these flags for point attachment.
+                    if offset_flags == SCALED_COMPONENT_OFFSET {
+                        component.transform.apply(offset)
+                    } else {
+                        offset
+                    }
+                }
+                ComponentPlacement::Points(parent_index, child_index) => {
+                    let parent = explicit_point(&glyph.contours, parent_index)?;
+                    let child = component.transform.apply(explicit_point(&contours, child_index)?);
+                    Vec2 { x: parent.x - child.x, y: parent.y - child.y }
+                }
+            };
+            for contour in &mut contours {
+                for point in &mut contour.points {
+                    let transformed = component.transform.apply(point.position());
+                    point.x = transformed.x + offset.x;
+                    point.y = transformed.y + offset.y;
+                }
+            }
+            // Move contour allocations; do not clone all of the child's points.
+            glyph.contours.append(&mut contours);
+            if component.flags & MORE_COMPONENTS == 0 {
+                break;
+            }
+        }
+        // The flag may occur on any component, not just the final one.
+        if has_instructions {
+            let length = usize::from(reader.u16()?);
+            require(data, reader.cursor, length, "composite glyph instructions")?;
+        }
+        Ok(glyph)
     }
 
     /// Returns horizontal metrics for a glyph ID.
     ///
     /// The `hmtx` rule that trailing glyphs reuse the last full advance width
     /// is already applied. Returns `None` for an out-of-range glyph ID.
+    /// These are raw table values; composite `USE_MY_METRICS` and hinting are
+    /// not resolved by this method.
     pub fn horizontal_metrics(&self, glyph_id: u16) -> Option<HorizontalMetrics> {
         self.horizontal_metrics.get(usize::from(glyph_id)).copied()
     }
@@ -796,14 +935,143 @@ fn parse_hmtx(
     Ok(metrics)
 }
 
+struct GlyphLoadBudget {
+    visits: usize,
+    points: usize,
+}
+
+/// Matrix coefficients in the order stored by glyf: xx, yx, xy, yy.
+#[derive(Clone, Copy)]
+struct ComponentTransform {
+    xx: f32,
+    yx: f32,
+    xy: f32,
+    yy: f32,
+}
+
+impl ComponentTransform {
+    const IDENTITY: Self = Self { xx: 1.0, yx: 0.0, xy: 0.0, yy: 1.0 };
+
+    fn apply(self, point: Vec2) -> Vec2 {
+        Vec2 {
+            x: self.xx * point.x + self.xy * point.y,
+            y: self.yx * point.x + self.yy * point.y,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ComponentPlacement {
+    Offset(Vec2),
+    Points(u16, u16),
+}
+
+struct GlyphComponent {
+    flags: u16,
+    glyph_id: u16,
+    placement: ComponentPlacement,
+    transform: ComponentTransform,
+}
+
+impl GlyphComponent {
+    fn read(reader: &mut GlyphReader<'_>) -> io::Result<Self> {
+        let flags = reader.u16()?;
+        let glyph_id = reader.u16()?;
+        let words = flags & ARG_1_AND_2_ARE_WORDS != 0;
+        let placement = if flags & ARGS_ARE_XY_VALUES != 0 {
+            // XY arguments are signed; point indices below are unsigned.
+            let (x, y) = if words {
+                (f32::from(reader.i16()?), f32::from(reader.i16()?))
+            } else {
+                (f32::from(reader.u8()? as i8), f32::from(reader.u8()? as i8))
+            };
+            ComponentPlacement::Offset(Vec2 { x, y })
+        } else {
+            let (parent, child) = if words {
+                (reader.u16()?, reader.u16()?)
+            } else {
+                (u16::from(reader.u8()?), u16::from(reader.u8()?))
+            };
+            ComponentPlacement::Points(parent, child)
+        };
+
+        let transform_flags = flags
+            & (WE_HAVE_A_SCALE | WE_HAVE_AN_X_AND_Y_SCALE | WE_HAVE_A_TWO_BY_TWO);
+        if transform_flags.count_ones() > 1 {
+            return Err(invalid_data("conflicting composite transform flags"));
+        }
+        let transform = match transform_flags {
+            WE_HAVE_A_SCALE => {
+                let scale = reader.f2dot14()?;
+                ComponentTransform { xx: scale, yy: scale, ..ComponentTransform::IDENTITY }
+            }
+            WE_HAVE_AN_X_AND_Y_SCALE => ComponentTransform {
+                xx: reader.f2dot14()?,
+                yy: reader.f2dot14()?,
+                ..ComponentTransform::IDENTITY
+            },
+            WE_HAVE_A_TWO_BY_TWO => ComponentTransform {
+                xx: reader.f2dot14()?,
+                yx: reader.f2dot14()?,
+                xy: reader.f2dot14()?,
+                yy: reader.f2dot14()?,
+            },
+            _ => ComponentTransform::IDENTITY,
+        };
+        Ok(Self { flags, glyph_id, placement, transform })
+    }
+}
+
+struct GlyphReader<'a> {
+    data: &'a [u8],
+    cursor: usize,
+}
+
+impl GlyphReader<'_> {
+    fn u8(&mut self) -> io::Result<u8> {
+        let value = read_u8(self.data, self.cursor)?;
+        self.cursor += 1;
+        Ok(value)
+    }
+
+    fn u16(&mut self) -> io::Result<u16> {
+        let value = read_u16(self.data, self.cursor)?;
+        self.cursor += 2;
+        Ok(value)
+    }
+
+    fn i16(&mut self) -> io::Result<i16> {
+        Ok(self.u16()? as i16)
+    }
+
+    fn f2dot14(&mut self) -> io::Result<f32> {
+        Ok(f32::from(self.i16()?) / 16384.0)
+    }
+}
+
+fn explicit_point(contours: &[Contour], index: u16) -> io::Result<Vec2> {
+    let mut remaining = usize::from(index);
+    for contour in contours {
+        if let Some(point) = contour.points.get(remaining) {
+            return Ok(point.position());
+        }
+        remaining -= contour.points.len();
+    }
+    // TrueType has four phantom points beyond the explicit contour points.
+    // Supporting them requires a metric-aware loader (including vertical metrics).
+    if remaining < 4 {
+        Err(Error::new(ErrorKind::Unsupported,
+            "composite attachment to phantom points is not supported"))
+    } else {
+        Err(invalid_data("composite attachment point is outside the glyph"))
+    }
+}
+
 fn parse_simple_glyph(data: &[u8]) -> io::Result<Option<Glyph>> {
     require(data, 0, 10, "glyf header")?;
     let number_of_contours = read_i16(data, 0)?;
     if number_of_contours < 0 {
-        return Err(Error::new(
-            ErrorKind::Unsupported,
-            "compound glyphs are not supported yet",
-        ));
+        return Err(invalid_data("composite passed to simple glyph decoder"));
     }
     let bounds = GlyphBounds {
         x_min: read_i16(data, 2)?,
@@ -1118,5 +1386,295 @@ mod tests {
                 left_side_bearing: 30,
             }
         );
+    }
+}
+
+
+#[cfg(test)]
+mod composite_tests {
+    use super::*;
+
+    fn header(contours: i16) -> Vec<u8> {
+        [contours, -100, -100, 1000, 1000]
+            .into_iter().flat_map(i16::to_be_bytes).collect()
+    }
+
+    fn simple(points: &[(i16, i16)]) -> Vec<u8> {
+        assert!(!points.is_empty());
+        let mut data = header(1);
+        data.extend_from_slice(&((points.len() - 1) as u16).to_be_bytes());
+        data.extend_from_slice(&0_u16.to_be_bytes()); // No instructions.
+        data.extend(std::iter::repeat_n(ON_CURVE_POINT, points.len()));
+        for axis in 0..2 {
+            let mut previous = 0_i16;
+            for &(x, y) in points {
+                let coordinate = if axis == 0 { x } else { y };
+                data.extend_from_slice(&(coordinate - previous).to_be_bytes());
+                previous = coordinate;
+            }
+        }
+        data
+    }
+
+    fn triangle() -> Vec<u8> {
+        simple(&[(0, 0), (10, 0), (0, 10)])
+    }
+
+    fn record(flags: u16, id: u16, args: &[u8], transform: &[i16]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&flags.to_be_bytes());
+        data.extend_from_slice(&id.to_be_bytes());
+        data.extend_from_slice(args);
+        for value in transform {
+            data.extend_from_slice(&value.to_be_bytes());
+        }
+        data
+    }
+
+    fn composite(records: &[Vec<u8>], instructions: Option<&[u8]>) -> Vec<u8> {
+        let mut data = header(-1);
+        for (index, record) in records.iter().enumerate() {
+            let mut flags = u16::from_be_bytes([record[0], record[1]]);
+            if index + 1 < records.len() {
+                flags |= MORE_COMPONENTS;
+            }
+            data.extend_from_slice(&flags.to_be_bytes());
+            data.extend_from_slice(&record[2..]);
+        }
+        if let Some(instructions) = instructions {
+            data.extend_from_slice(&(instructions.len() as u16).to_be_bytes());
+            data.extend_from_slice(instructions);
+        }
+        data
+    }
+
+    // Exercise the public loader with synthetic glyf/loca data; no external font
+    // fixture or third-party crate is required by these tests.
+    fn font(glyphs: &[Vec<u8>]) -> TTFParser {
+        let mut bytes = Vec::new();
+        let mut offsets = vec![0];
+        for glyph in glyphs {
+            bytes.extend_from_slice(glyph);
+            offsets.push(bytes.len() as u32);
+        }
+        let mut tables = HashMap::new();
+        tables.insert(*b"glyf", TableRecord { offset: 0, length: bytes.len() });
+        TTFParser {
+            font_data: bytes,
+            font_tables: tables,
+            head_data: HeadData { units_per_em: 1000, index_to_loc_format: 1 },
+            maxp_table: MaxpTable { version: 0x0001_0000, num_glyphs: glyphs.len() as u16 },
+            hhea_table: HheaTable {
+                ascender: 800, descender: -200, line_gap: 0,
+                number_of_h_metrics: glyphs.len() as u16,
+            },
+            cmaps: Vec::new(),
+            glyph_offsets: offsets,
+            horizontal_metrics: vec![HorizontalMetrics {
+                advance_width: 500, left_side_bearing: 0,
+            }; glyphs.len()],
+        }
+    }
+
+    fn points(glyph: &Glyph) -> Vec<(f32, f32)> {
+        glyph.contours.iter().flat_map(|c| c.points.iter())
+            .map(|p| (p.x, p.y)).collect()
+    }
+
+    #[test]
+    fn signed_byte_offsets_and_contour_closure() {
+        let data = composite(&[record(ARGS_ARE_XY_VALUES, 0, &[254, 100], &[])], None);
+        let parser = font(&[triangle(), data]);
+        let glyph = parser.load_glyph(1).unwrap().unwrap();
+        assert_eq!(points(&glyph), [(-2.0, 100.0), (8.0, 100.0), (-2.0, 110.0)]);
+        assert_eq!(glyph.path_commands().last(), Some(&PathCommand::LineTo(Vec2 {
+            x: -2.0, y: 100.0,
+        })));
+    }
+
+    #[test]
+    fn signed_word_offsets() {
+        let args: Vec<u8> = [-300_i16, 400].into_iter().flat_map(i16::to_be_bytes).collect();
+        let data = composite(&[record(ARGS_ARE_XY_VALUES | ARG_1_AND_2_ARE_WORDS,
+            0, &args, &[])], None);
+        let glyph = font(&[triangle(), data]).load_glyph(1).unwrap().unwrap();
+        assert_eq!(points(&glyph)[0], (-300.0, 400.0));
+    }
+
+    #[test]
+    fn uniform_nonuniform_and_full_matrix_transforms() {
+        let cases = [
+            (WE_HAVE_A_SCALE, vec![8192], vec![(0.0, 0.0), (5.0, 0.0), (0.0, 5.0)]),
+            (WE_HAVE_AN_X_AND_Y_SCALE, vec![8192, 24576],
+                vec![(0.0, 0.0), (5.0, 0.0), (0.0, 15.0)]),
+            // Stored order is xx, yx, xy, yy. Unequal off-diagonals detect transposition.
+            (WE_HAVE_A_TWO_BY_TWO, vec![16384, 8192, -4096, 24576],
+                vec![(0.0, 0.0), (10.0, 5.0), (-2.5, 15.0)]),
+        ];
+        for (flags, transform, expected) in cases {
+            let data = composite(&[record(flags | ARGS_ARE_XY_VALUES,
+                0, &[0, 0], &transform)], None);
+            let glyph = font(&[triangle(), data]).load_glyph(1).unwrap().unwrap();
+            assert_eq!(points(&glyph), expected);
+        }
+    }
+
+    #[test]
+    fn offset_scaling_default_and_conflicting_flags() {
+        for (offset_flags, expected) in [
+            (0, (10.0, 20.0)),
+            (UNSCALED_COMPONENT_OFFSET, (10.0, 20.0)),
+            (SCALED_COMPONENT_OFFSET, (5.0, 10.0)),
+            (SCALED_COMPONENT_OFFSET | UNSCALED_COMPONENT_OFFSET, (10.0, 20.0)),
+        ] {
+            let data = composite(&[record(ARGS_ARE_XY_VALUES | WE_HAVE_A_SCALE | offset_flags,
+                0, &[10, 20], &[8192])], None);
+            let glyph = font(&[triangle(), data]).load_glyph(1).unwrap().unwrap();
+            assert_eq!(points(&glyph)[0], expected);
+        }
+    }
+
+    #[test]
+    fn nested_components_and_repeated_siblings_are_allowed() {
+        let child = composite(&[record(ARGS_ARE_XY_VALUES, 0, &[10, 20], &[])], None);
+        let parent = composite(&[
+            record(ARGS_ARE_XY_VALUES | WE_HAVE_A_SCALE, 1, &[100, 0], &[8192]),
+            record(ARGS_ARE_XY_VALUES, 1, &[0, 0], &[]),
+        ], None);
+        let glyph = font(&[triangle(), child, parent]).load_glyph(2).unwrap().unwrap();
+        assert_eq!(points(&glyph), [
+            (105.0, 10.0), (110.0, 10.0), (105.0, 15.0),
+            (10.0, 20.0), (20.0, 20.0), (10.0, 30.0),
+        ]);
+    }
+
+    #[test]
+    fn point_attachment_after_transform() {
+        let data = composite(&[
+            record(ARGS_ARE_XY_VALUES, 0, &[100, 100], &[]),
+            record(WE_HAVE_A_SCALE, 0, &[1, 2], &[8192]),
+        ], None);
+        let glyph = font(&[triangle(), data]).load_glyph(1).unwrap().unwrap();
+        assert_eq!(points(&glyph)[3], (110.0, 95.0));
+        assert_eq!(points(&glyph)[5], points(&glyph)[1]);
+    }
+
+    #[test]
+    fn unsigned_point_indices_in_byte_and_word_forms() {
+        let leaf = simple(&(0_i16..201).map(|x| (x, 0)).collect::<Vec<_>>());
+        for (flags, args) in [(0, vec![200, 200]),
+            (ARG_1_AND_2_ARE_WORDS, vec![0, 200, 0, 200])] {
+            let data = composite(&[
+                record(ARGS_ARE_XY_VALUES, 0, &[10, 20], &[]),
+                record(flags, 0, &args, &[]),
+            ], None);
+            let glyph = font(&[leaf.clone(), data]).load_glyph(1).unwrap().unwrap();
+            assert_eq!(points(&glyph)[401], (210.0, 20.0));
+        }
+    }
+
+    #[test]
+    fn attachment_indices_span_contours_and_exclude_implied_points() {
+        let mut leaf = triangle();
+        leaf[15] = 0;
+        leaf[16] = 0; // Consecutive off-curve controls imply an extra path point.
+        let child = composite(&[
+            record(ARGS_ARE_XY_VALUES, 0, &[0, 0], &[]),
+            record(ARGS_ARE_XY_VALUES, 0, &[100, 0], &[]),
+        ], None);
+        let parent = composite(&[
+            record(ARGS_ARE_XY_VALUES, 1, &[0, 0], &[]),
+            record(0, 0, &[4, 1], &[]),
+        ], None);
+        let glyph = font(&[leaf, child, parent]).load_glyph(2).unwrap().unwrap();
+        assert_eq!(points(&glyph)[7], points(&glyph)[4]);
+        assert!(!glyph.contours[2].points[1].on_curve);
+    }
+
+    #[test]
+    fn instructions_on_nonfinal_component_are_checked() {
+        let records = [
+            record(ARGS_ARE_XY_VALUES | WE_HAVE_INSTRUCTIONS, 0, &[0, 0], &[]),
+            record(ARGS_ARE_XY_VALUES, 0, &[10, 0], &[]),
+        ];
+        let data = composite(&records, Some(&[0, 1, 2]));
+        assert!(font(&[triangle(), data.clone()]).load_glyph(1).is_ok());
+        let mut truncated = data;
+        truncated.pop();
+        assert_eq!(font(&[triangle(), truncated]).load_glyph(1).unwrap_err().kind(),
+            ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn malformed_components_and_phantom_points_are_reported() {
+        let invalid_records = [
+            record(ARGS_ARE_XY_VALUES, 99, &[0, 0], &[]),
+            record(ARGS_ARE_XY_VALUES | WE_HAVE_A_SCALE | WE_HAVE_A_TWO_BY_TWO,
+                0, &[0, 0], &[]),
+            record(0, 0, &[0, 0], &[]), // First component cannot use point attachment.
+        ];
+        for record in invalid_records {
+            let data = composite(&[record], None);
+            assert_eq!(font(&[triangle(), data]).load_glyph(1).unwrap_err().kind(),
+                ErrorKind::InvalidData);
+        }
+        for (index, expected) in [(3, ErrorKind::Unsupported), (100, ErrorKind::InvalidData)] {
+            let data = composite(&[
+                record(ARGS_ARE_XY_VALUES, 0, &[0, 0], &[]),
+                record(0, 0, &[0, index], &[]),
+            ], None);
+            assert_eq!(font(&[triangle(), data]).load_glyph(1).unwrap_err().kind(), expected);
+        }
+    }
+
+    #[test]
+    fn truncated_component_records_are_rejected() {
+        let data = composite(&[record(ARGS_ARE_XY_VALUES | WE_HAVE_A_TWO_BY_TWO,
+            0, &[0, 0], &[16384, 0, 0, 16384])], None);
+        for end in 10..data.len() {
+            let truncated = data[..end].to_vec();
+            assert_eq!(font(&[triangle(), truncated]).load_glyph(1).unwrap_err().kind(),
+                ErrorKind::UnexpectedEof);
+        }
+    }
+
+    #[test]
+    fn empty_components_and_missing_glyph_data() {
+        let data = composite(&[record(ARGS_ARE_XY_VALUES, 0, &[0, 0], &[])], None);
+        let parser = font(&[Vec::new(), data]);
+        assert!(parser.load_glyph(0).unwrap().is_none());
+        assert!(parser.load_glyph(1).unwrap().unwrap().contours.is_empty());
+    }
+
+    #[test]
+    fn cycles_and_depth_limits_are_rejected() {
+        let direct = composite(&[record(ARGS_ARE_XY_VALUES, 0, &[0, 0], &[])], None);
+        assert_eq!(font(&[direct]).load_glyph(0).unwrap_err().kind(), ErrorKind::InvalidData);
+        let a = composite(&[record(ARGS_ARE_XY_VALUES, 1, &[0, 0], &[])], None);
+        let b = composite(&[record(ARGS_ARE_XY_VALUES, 0, &[0, 0], &[])], None);
+        assert_eq!(font(&[a, b]).load_glyph(0).unwrap_err().kind(), ErrorKind::InvalidData);
+        let mut glyphs = vec![triangle()];
+        for id in 0..MAX_GLYPH_LOAD_DEPTH as u16 {
+            glyphs.push(composite(&[record(ARGS_ARE_XY_VALUES, id, &[0, 0], &[])], None));
+        }
+        assert!(font(&glyphs).load_glyph(MAX_GLYPH_LOAD_DEPTH as u16 - 1).is_ok());
+        assert_eq!(font(&glyphs).load_glyph(MAX_GLYPH_LOAD_DEPTH as u16)
+            .unwrap_err().kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn expansion_budgets_apply_across_siblings() {
+        let data = composite(&[
+            record(ARGS_ARE_XY_VALUES, 0, &[0, 0], &[]),
+            record(ARGS_ARE_XY_VALUES, 0, &[0, 0], &[]),
+        ], None);
+        let parser = font(&[triangle(), data]);
+        for (visits, points) in [(2, 100), (100, 5)] {
+            let mut active = Vec::new();
+            let mut budget = GlyphLoadBudget { visits, points };
+            assert_eq!(parser.load_glyph_inner(1, &mut active, &mut budget)
+                .unwrap_err().kind(), ErrorKind::InvalidData);
+            assert!(active.is_empty());
+        }
     }
 }

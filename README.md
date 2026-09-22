@@ -15,7 +15,9 @@ git submodule update --init --recursive
 cargo run -- --validation
 ```
 
-The executable in `src/main.rs` is a complete triangle-rendering window example. The
+The executable in `src/main.rs` is a cached text-rendering example. It uses a
+compute shader to rasterize TrueType outlines into an atlas once, then renders
+"Hello Text" and a live, smoothly scaling FPS label from that atlas. The
 application owns the window/event loop; the graphics library retains an
 `Arc<Window>`. Windows and Linux surfaces go through `ash-window`.
 
