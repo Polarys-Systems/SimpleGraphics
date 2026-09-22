@@ -248,21 +248,7 @@ fn spirv_words(bytes: &[u8]) -> Vec<u32> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-<<<<<<< HEAD
-=======
-    
-    // font processing
-    //
-    let font_data = std::fs::read("./data/Syne/static/Syne-Regular.ttf")?;
-    let font = FontRef::from_index(&font_data, 0)?;
-    let shaper_data = ShaperData::new(&font);
-    let shaper = ShaperData::shaper(&shaper_data, &font);
 
-    let mut parser = simple_ttf::TTFParser::read_from("./data/Syne/static/Syne-Regular.ttf").expect("failed to read font");
-
-    parser.parse_information();
-
->>>>>>> fbbe8de0561c4e77fb9190bbd5b5f241a5ae6e33
     let mut app = App::default();
     let mut arguments = std::env::args().skip(1);
 
