@@ -14,7 +14,6 @@
 #![doc = include_str!("../README.md")]
 
 pub use ash::vk;
-pub use harfrust;
 /// Required loader/device version. The stable ash 0.38 bindings expose all core
 /// commands used here; Vulkan 1.4 preserves those commands and feature structures.
 pub const VULKAN_API_VERSION: u32 = vk::make_api_version(0, 1, 4, 0);

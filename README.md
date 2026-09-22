@@ -29,22 +29,6 @@ cargo run -- --validation --resize-test --frames 12
 Messages are printed to stderr; `validation_error_count` exposes the error count.
 Without validation, the validation layer is not required.
 
-### Pinned source dependencies
-
-HarfRust is tracked as the `src/harfrust` Git submodule and is pinned to a
-release commit. The root `Cargo.toml` depends on the `harfrust` crate inside
-that submodule, while `Cargo.lock` pins its registry dependencies.
-
-To update HarfRust, fetch its tags, check out the desired release in detached
-HEAD mode, update the matching version in `Cargo.toml`, and regenerate the
-lockfile:
-
-```sh
-git -C src/harfrust fetch --tags
-git -C src/harfrust checkout --detach <release-tag>
-cargo check
-```
-
 ### Vulkan version and bindings
 
 Both the loader and the selected physical device must support Vulkan 1.4.

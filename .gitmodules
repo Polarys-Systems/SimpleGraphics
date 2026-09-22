@@ -7,6 +7,3 @@
 [submodule "src/winit"]
 	path = src/winit
 	url = https://github.com/rust-windowing/winit.git
-[submodule "src/harfrust"]
-	path = src/harfrust
-	url = https://github.com/harfbuzz/harfrust.git

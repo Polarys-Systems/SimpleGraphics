@@ -7,7 +7,6 @@ rust-version = "1.88"
 [dependencies]
 ash = { path = "./src/ash/ash", default-features = false, features = ["loaded", "debug", "std"] }
 ash-window = { path = "./src/ash/ash-window" }
-harfrust = { path = "./src/harfrust/harfrust", version = "0.13.3" }
 vk-mem = { path = "./src/vk-mem-rs" }
 winit = { path = "./src/winit", version = "0.30.13" }
 
